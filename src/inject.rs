@@ -17,6 +17,7 @@ use wayland_client::protocol::wl_keyboard::KeymapFormat;
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1;
 
 const KEY_BACKSPACE: u32 = 14;
+const KEY_LEFTSHIFT: u32 = 42;
 
 /// evdev codes of printable keys, used to carry the replacement characters.
 /// Printable on purpose: Chromium may fall back to a key's physical meaning.
@@ -33,9 +34,13 @@ pub struct Injector {
 
 /// XKB keymap with BackSpace and `chars` on `TEXT_KEYS`, one level each (so a
 /// held Shift or Caps Lock cannot change them).
+///
+/// It also maps a Shift key (never pressed): GTK3 ignores BackSpace from a
+/// keymap that has no modifier keys at all.
 pub fn keymap(chars: &[char]) -> String {
-    let mut codes = format!("    <BKSP> = {};\n", KEY_BACKSPACE + 8);
-    let mut syms = String::from("    key <BKSP> { [ BackSpace ] };\n");
+    let mut codes = format!("    <BKSP> = {};\n    <LFSH> = {};\n", KEY_BACKSPACE + 8, KEY_LEFTSHIFT + 8);
+    let mut syms =
+        String::from("    key <BKSP> { [ BackSpace ] };\n    key <LFSH> { [ Shift_L ] };\n    modifier_map Shift { <LFSH> };\n");
     for (i, c) in chars.iter().enumerate() {
         codes += &format!("    <K{i:02}> = {};\n", TEXT_KEYS[i] + 8);
         syms += &format!("    key <K{i:02}> {{ [ U{:04X} ] }};\n", *c as u32);
@@ -118,5 +123,10 @@ mod tests {
             assert_eq!(state.key_get_utf8(xkb::Keycode::new(TEXT_KEYS[i] + 8)), c.to_string());
         }
         assert_eq!(state.key_get_one_sym(xkb::Keycode::new(KEY_BACKSPACE + 8)).raw(), 0xff08);
+        // GTK3 needs a real modifier in the keymap to accept BackSpace.
+        let mut state = xkb::State::new(&km);
+        state.update_key(xkb::Keycode::new(KEY_LEFTSHIFT + 8), xkb::KeyDirection::Down);
+        assert!(state.mod_name_is_active(xkb::MOD_NAME_SHIFT, xkb::STATE_MODS_EFFECTIVE));
+        assert!(!TEXT_KEYS.contains(&KEY_LEFTSHIFT));
     }
 }
