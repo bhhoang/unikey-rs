@@ -938,7 +938,15 @@ impl Engine {
             if entry.caps != 0 {
                 prev_sym -= 1;
             }
-            if prev_sym == ev.vn_sym {
+            // Unlike the original, a letter key undoes in either case: Shift+W then
+            // w undoes "Ư" too, and the letter keeps the first key's case ("Ww" ->
+            // "W"). Symbol keys stay exact: "]" and "}" are different keys.
+            let letter = ev.key_code < 128 && (ev.key_code as u8).is_ascii_alphabetic();
+            if prev_sym == ev.vn_sym || (letter && prev_sym == change_case(ev.vn_sym)) {
+                if letter {
+                    let k = ev.key_code as u8;
+                    ev.key_code = if entry.caps != 0 { k.to_ascii_uppercase() } else { k.to_ascii_lowercase() } as _;
+                }
                 if entry.form != VNW_C {
                     let v_end = self.current - entry.v_offset;
                     let vs = self.w(v_end).seq;

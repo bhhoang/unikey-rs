@@ -153,3 +153,11 @@ fn simple_telex_w() {
     assert_eq!(typed(SimpleTelex, "awn "), "ăn ");
     assert_eq!(typed(Telex, "w "), "ư ");
 }
+
+#[test]
+fn w_undo_ignores_case() {
+    // Shift+W then w undoes "Ư" too; the letter keeps the first key's case.
+    for (keys, want) in [("WW", "W"), ("Ww", "W"), ("ww", "w"), ("wW", "w"), ("AWw", "Aw"), ("aww", "aw")] {
+        assert_eq!(typed(Telex, keys), want, "{keys}");
+    }
+}
