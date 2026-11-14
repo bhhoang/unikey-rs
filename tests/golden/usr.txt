@@ -1,0 +1,13 @@
+; test layout
+a = Tone1
+s = Tone2
+d = Tone3
+f = Tone4
+g = Tone5
+q = Roof-All
+w = Hook-Bowl
+e = Bowl
+r = D-Mark
+[ = u+
+] = o+
+x = Escape

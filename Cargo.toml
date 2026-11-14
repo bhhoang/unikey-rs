@@ -1,0 +1,36 @@
+[package]
+name = "unikey"
+version = "0.1.0"
+edition = "2021"
+description = "UniKey Vietnamese input engine, ported to Rust, with a native Wayland frontend"
+license = "GPL-3.0-or-later"
+
+[lib]
+name = "unikey"
+path = "src/lib.rs"
+
+[[bin]]
+name = "unikey"
+path = "src/main.rs"
+
+[[bin]]
+name = "unikey-settings"
+path = "src/bin/unikey-settings.rs"
+
+[dependencies]
+# Pinned: the installed Cargo (1.80) cannot parse newer crates that use edition 2024.
+wayland-client = "=0.31.5"
+wayland-protocols-misc = { version = "=0.3.3", features = ["client"] }
+wayland-protocols-wlr = { version = "=0.3.3", features = ["client"] }
+xkbcommon = "=0.7.0"
+libc = "0.2"
+ksni = "=0.2.2"
+x11rb = { version = "=0.13.1", features = ["xinput", "xkb", "xtest"] }
+# settings app
+gtk = { package = "gtk4", version = "=0.9.6", features = ["v4_14"] }
+adw = { package = "libadwaita", version = "=0.7.2", features = ["v1_5"] }
+
+[profile.release]
+opt-level = 2
+lto = true
+strip = true

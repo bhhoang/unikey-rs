@@ -1,0 +1,7 @@
+;DO NOT DELETE THIS LINE*** version=1 ***
+vn:Việt Nam
+tp:thành phố
+Hn:Hà Nội
+ko:không
+cty:công ty
+q:quá
