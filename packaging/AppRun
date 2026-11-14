@@ -1,0 +1,8 @@
+#!/bin/sh
+# `unikey.AppImage` runs the daemon, `unikey.AppImage settings` the settings window.
+HERE="${APPDIR:-$(dirname "$(readlink -f "$0")")}"
+if [ "$1" = settings ]; then
+    shift
+    exec "$HERE/usr/bin/unikey-settings" "$@"
+fi
+exec "$HERE/usr/bin/unikey" "$@"

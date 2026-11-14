@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=unikey
+Comment=Vietnamese typing (UniKey)
+Exec=unikey
+Icon=unikey
+Categories=Utility;
+Terminal=false
