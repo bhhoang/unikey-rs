@@ -5,6 +5,9 @@
 //! While a text field is focused the compositor hands us the keyboard (input
 //! method v2 grab). Keys we do not convert are replayed through a virtual
 //! keyboard, so applications see them as normal key presses.
+//!
+//! GNOME has no such protocol: there `unikey --ibus` runs as an IBus engine
+//! instead (see `ibus`).
 
 mod apps;
 mod config;
@@ -53,6 +56,9 @@ macro_rules! log {
         }
     };
 }
+
+// After `log!`, which it uses.
+mod ibus;
 
 /// xkb keycodes are evdev codes + 8.
 const XKB_OFFSET: u32 = 8;
@@ -1113,8 +1119,27 @@ wayland_client::delegate_noop!(App: ZwpInputMethodManagerV2);
 wayland_client::delegate_noop!(App: ZwpVirtualKeyboardManagerV1);
 wayland_client::delegate_noop!(App: ZwpVirtualKeyboardV1);
 
+const USAGE: &str = "usage: unikey [--ibus | ibus-install]
+
+  (no argument)  run the input method (Wayland input method, or X11)
+  ibus-install   use unikey through IBus: needed on GNOME (asks for sudo)
+  --ibus         run as the IBus engine (started by ibus-daemon)";
+
 fn main() {
     let sig_fd = signal_fd();
+    match std::env::args().nth(1).as_deref() {
+        None => {}
+        Some("--ibus") => ibus::run(sig_fd),
+        Some("ibus-install") => return ibus::install(),
+        Some("-h" | "--help") => return println!("{USAGE}"),
+        Some(other) => die(&format!("unknown argument {other:?}\n{USAGE}")),
+    }
+    if unikey::settings::runs_in_ibus() {
+        // IBus runs `unikey --ibus` for every app, X11 ones included: a second
+        // unikey here would convert their keys twice.
+        eprintln!("unikey: on GNOME unikey runs inside IBus: pick \"Vietnamese (UniKey)\" in Settings → Keyboard → Input Sources (Super+Space)");
+        return;
+    }
     let cfg = config::Config::load();
     let mut app = App::new(cfg);
     let wayland = connect_wayland(&mut app);
@@ -1138,7 +1163,23 @@ fn connect_wayland(app: &mut App) -> Option<(Connection, EventQueue<App>)> {
     let (Some(seat), Some(manager), Some(vk_manager)) =
         (app.seat.clone(), app.manager.clone(), app.vk_manager.clone())
     else {
-        eprintln!("unikey: the compositor has no zwp_input_method_v2/zwp_virtual_keyboard_v1: X11 apps only");
+        if unikey::settings::is_gnome() {
+            eprintln!(
+                "unikey: GNOME offers no input method protocol to applications, only IBus. \
+                 Without it only X11 (XWayland) apps get Vietnamese typing. \
+                 For every app run `unikey ibus-install` once (it asks for sudo)."
+            );
+        } else {
+            let missing: Vec<_> = [
+                (app.seat.is_none(), "wl_seat"),
+                (app.manager.is_none(), "zwp_input_method_manager_v2"),
+                (app.vk_manager.is_none(), "zwp_virtual_keyboard_manager_v1"),
+            ]
+            .into_iter()
+            .filter_map(|(gone, name)| gone.then_some(name))
+            .collect();
+            eprintln!("unikey: the compositor does not offer {}: X11 (XWayland) apps only", missing.join(" or "));
+        }
         return None;
     };
     app.qh = Some(qh.clone());

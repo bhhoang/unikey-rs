@@ -156,6 +156,20 @@ impl Settings {
     }
 }
 
+/// The IBus component file `unikey ibus-install` writes (see `ibus.rs`). IBus
+/// only reads components from this system directory.
+pub const IBUS_COMPONENT: &str = "/usr/share/ibus/component/unikey-rs.xml";
+
+/// A GNOME session: no input method protocol on Wayland, only IBus.
+pub fn is_gnome() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.split(':').any(|d| d.eq_ignore_ascii_case("GNOME")))
+}
+
+/// On GNOME with `unikey ibus-install` done, IBus starts unikey when needed.
+pub fn runs_in_ibus() -> bool {
+    is_gnome() && std::path::Path::new(IBUS_COMPONENT).exists()
+}
+
 /// Process ids of running `unikey` input methods.
 pub fn daemon_pids() -> Vec<i32> {
     let Ok(dir) = fs::read_dir("/proc") else { return Vec::new() };

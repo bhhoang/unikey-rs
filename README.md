@@ -22,6 +22,7 @@ Supports Telex, VNI, VIQR, MS VI and Simple Telex, plus macros and spell check.
   - [openSUSE](#opensuse)
   - [AppImage](#appimage)
 - [Start it with your session](#start-it-with-your-session)
+  - [GNOME](#gnome)
 - [Use](#use)
 - [Uninstall](#uninstall)
 - [License](#license)
@@ -32,7 +33,8 @@ Supports Telex, VNI, VIQR, MS VI and Simple Telex, plus macros and spell check.
 |---|---|
 | Hyprland, Sway, River, labwc, Wayfire, Niri | Full |
 | Any X11 session | Full |
-| GNOME / KDE on Wayland | X11 (XWayland) apps only |
+| GNOME on Wayland | Full, through IBus ([set up once](#gnome)) |
+| KDE on Wayland | X11 (XWayland) apps only |
 
 ## Install
 
@@ -93,6 +95,25 @@ start `unikey` when you log in:
 - **Sway** (`config`): `exec unikey`
 - **Other desktops**: add `unikey` to your startup applications.
 
+### GNOME
+
+GNOME on Wayland does not let other programs act as an input method:
+it sends every key to IBus. So on GNOME unikey runs as an IBus engine. Set it
+up once (it asks for your password to write
+`/usr/share/ibus/component/unikey-rs.xml`):
+
+    unikey ibus-install
+
+This also adds **Vietnamese (UniKey)** to Settings → Keyboard → Input
+Sources. Switch to it with Super+Space. IBus starts unikey on its own, so leave
+it out of your startup applications. Inside it, Ctrl+Shift (or Alt+Z) still
+switches VI/EN, and the top bar shows VI/EN.
+
+Apps that report the text around the cursor (GTK, Qt, Firefox) get each
+correction in one step. Terminals get Backspace key presses, as on other
+desktops. Chrome and Electron apps need `--enable-wayland-ime` to use any
+input method on GNOME.
+
 ## Use
 
 - **Ctrl+Shift** or **Alt+Z**: switch between Vietnamese (VI) and English (EN).
@@ -107,7 +128,10 @@ The settings are saved in `~/.config/unikey/config`.
 
     cargo uninstall unikey
 
-Then remove `unikey` from your autostart.
+Then remove `unikey` from your autostart. On GNOME, also remove the input source
+in Settings and the IBus component:
+
+    sudo rm /usr/share/ibus/component/unikey-rs.xml
 
 ## License
 

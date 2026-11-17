@@ -25,6 +25,8 @@ wayland-protocols-wlr = { version = "=0.3.3", features = ["client"] }
 xkbcommon = "=0.7.0"
 libc = "0.2"
 ksni = "=0.2.2"
+# IBus engine (GNOME): already in the tree through ksni
+dbus = "=0.9.12"
 x11rb = { version = "=0.13.1", features = ["xinput", "xkb", "xtest"] }
 # settings app
 gtk = { package = "gtk4", version = "=0.9.6", features = ["v4_14"] }
