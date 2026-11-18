@@ -98,10 +98,40 @@ enum Wait {
     Report,
     /// Then commit this text (engine object path, text).
     Commit(String, String),
-    /// A correction replacing all of a field's text went in as "insert, then
-    /// delete what is before it" (see `Ime::edit`); the report tells whether the
-    /// deletion was dropped. (path, text before the edit, deleted count, inserted text)
-    Replace(String, String, usize, String),
+    /// Wait to see whether the client applied the deletion as well as the commit.
+    Replace(Replacement),
+}
+
+struct Replacement {
+    path: String,
+    before: String,
+    expected: String,
+    duplicated: String,
+    retype_backs: usize,
+    text: String,
+    insert_first: bool,
+}
+
+impl Replacement {
+    fn new(path: &str, before: &str, deleted_bytes: usize, backs: usize, text: &str, insert_first: bool) -> Self {
+        Self {
+            path: path.to_owned(),
+            before: before.to_owned(),
+            expected: format!("{}{text}", &before[..before.len() - deleted_bytes]),
+            duplicated: format!("{before}{text}"),
+            retype_backs: backs + text.chars().count(),
+            text: text.to_owned(),
+            insert_first,
+        }
+    }
+
+    fn repair_needed(&self, reported: Option<&str>) -> bool {
+        // Only the insert-first workaround has to cope with Firefox giving no
+        // fresh report. Don't erase text after an ordinary correction unless
+        // the field actually shows that it kept the old characters.
+        reported == Some(&self.duplicated)
+            || (self.insert_first && (reported.is_none() || reported == Some(&self.before)))
+    }
 }
 
 /// How long a report showing the insertion but not the deletion must stay the
@@ -138,6 +168,9 @@ struct Ime {
     queued_at: Instant,
     /// This field's reports did not catch up in time once: stop waiting for them.
     reports_lag: bool,
+    /// This field ignored a deletion that touched the cursor. Use Backspace
+    /// until focus changes instead of probing on every tone mark.
+    deletes_ignored: bool,
 }
 
 impl Ime {
@@ -164,6 +197,7 @@ impl Ime {
             held: VecDeque::new(),
             queued_at: Instant::now(),
             reports_lag: false,
+            deletes_ignored: false,
         }
     }
 
@@ -201,19 +235,11 @@ impl Ime {
             self.commit(path, text);
             let len = text.chars().count();
             self.send(self.signal(path, "DeleteSurroundingText").append2(-((backs + len) as i32), backs as u32));
-            let before = self.before.clone().unwrap_or_default();
-            self.gate = Some((Wait::Replace(path.to_owned(), before, backs, text.to_owned()), Instant::now() + REPORT_WAIT));
         } else if atomic {
             let n = backs as u32;
             self.send(self.signal(path, "DeleteSurroundingText").append2(-(n as i32), n));
-        } else {
-            for _ in 0..backs {
-                self.forward_key(path, KS_BACKSPACE, KEY_BACKSPACE, 0);
-                self.forward_key(path, KS_BACKSPACE, KEY_BACKSPACE, RELEASE);
-            }
-            if backs > 0 {
-                self.queued_at = Instant::now();
-            }
+        } else if backs > 0 {
+            self.forward_backspaces(path, backs);
         }
         let settled = self.queued_at + KEY_SETTLE;
         if !text.is_empty() && !replace {
@@ -224,6 +250,13 @@ impl Ime {
                 self.gate = Some((Wait::Commit(path.to_owned(), text.to_owned()), settled));
             }
         }
+        if atomic && !text.is_empty() {
+            if let Some(before) = &self.before {
+                let deleted_bytes = self.shown.iter().rev().take(backs).map(|c| c.len_utf8()).sum();
+                let replacement = Replacement::new(path, before, deleted_bytes, backs, text, replace);
+                self.gate = Some((Wait::Replace(replacement), Instant::now() + REPORT_WAIT));
+            }
+        }
         let keep = self.shown.len().saturating_sub(backs);
         self.shown.truncate(keep);
         self.shown.extend(text.chars());
@@ -232,12 +265,21 @@ impl Ime {
         }
     }
 
+    fn forward_backspaces(&mut self, path: &str, backs: usize) {
+        for _ in 0..backs {
+            self.forward_key(path, KS_BACKSPACE, KEY_BACKSPACE, 0);
+            self.forward_key(path, KS_BACKSPACE, KEY_BACKSPACE, RELEASE);
+        }
+        self.queued_at = Instant::now();
+    }
+
     /// Whether the application can delete the `n` characters before the cursor
     /// itself: it reports its text, and the last report ends with the characters
     /// we typed there. GNOME Shell drops a deletion it cannot place, so a report
     /// that has not caught up with our last edit means Backspace keys instead.
     fn can_delete_surrounding(&self, n: usize) -> bool {
-        self.caps & CAP_SURROUNDING_TEXT != 0
+        !self.deletes_ignored
+            && self.waits_for_reports()
             && self.shown.len() >= n
             && self
                 .before
@@ -298,21 +340,18 @@ impl Ime {
 
     /// The field reported its text: maybe what a held key waits for.
     fn on_report(&mut self) {
-        let Some(now) = self.before.clone() else { return };
-        match &self.gate {
-            Some((Wait::Report, _)) if self.report_caught_up() => {}
-            Some((Wait::Replace(_, before, _, text), until)) => {
-                if now == format!("{before}{text}") {
-                    // Mutter dropped the deletion (an application), or a Shell entry
-                    // reports between the insertion and the deletion: the latter's
-                    // next report follows at once (see `replace_settled`).
-                    let until = (*until).min(Instant::now() + REPLACE_SETTLE);
-                    if let Some((_, u)) = self.gate.as_mut() {
-                        *u = until;
-                    }
+        let Some(now) = self.before.as_deref() else { return };
+        let caught_up = self.report_caught_up();
+        match &mut self.gate {
+            Some((Wait::Report, _)) if caught_up => {}
+            Some((Wait::Replace(replacement), until)) => {
+                if now == replacement.duplicated {
+                    // The client dropped the deletion, or reported between the
+                    // commit and deletion. Give the final report time to arrive.
+                    *until = (*until).min(Instant::now() + REPLACE_SETTLE);
                     return;
                 }
-                if now != *text {
+                if now != replacement.expected {
                     return; // a report from before the edit
                 }
             }
@@ -322,36 +361,22 @@ impl Ime {
         self.drain();
     }
 
-    /// The `Wait::Replace` deadline. Only GNOME Shell's own entries apply the
-    /// insert-then-delete, and they report the result at once. Anything else (the
-    /// old text and the new, a stale report, none at all: Firefox resets the field
-    /// and reports nothing) means the deletion was dropped: replace both.
+    /// Repair an ignored deletion with key events. A second surrounding-text
+    /// deletion is not reliable here: Chromium can ignore it too.
     fn replace_settled(&mut self) -> bool {
-        if !matches!(self.gate, Some((Wait::Replace(..), _))) {
-            return false;
+        let Some((Wait::Replace(replacement), _)) = &self.gate else { return false };
+        if !replacement.repair_needed(self.before.as_deref()) {
+            self.reports_lag = true;
+            return false; // tick opens the gate and drains any held keys
         }
-        let Some((Wait::Replace(path, before, backs, text), _)) = self.gate.take() else { return false };
-        if self.before.as_deref() == Some(text.as_str()) {
-            self.gate = None;
-            return false;
+        let Some((Wait::Replace(replacement), _)) = self.gate.take() else { unreachable!() };
+        if !replacement.insert_first {
+            self.deletes_ignored = true;
         }
-        let n = backs + text.chars().count();
-        if self.before.as_deref() == Some(&format!("{before}{text}")) {
-            // Mutter knows the text: one atomic step.
-            log!("ibus: deletion dropped, replacing {before:?}{text:?} with {text:?}");
-            self.send(self.signal(&path, "DeleteSurroundingText").append2(-(n as i32), n as u32));
-            self.commit(&path, &text);
-            self.gate = Some((Wait::Report, Instant::now() + REPORT_WAIT));
-        } else {
-            // No fresh report to count a deletion against: Backspace keys, then the text.
-            log!("ibus: deletion dropped, no report: retyping {text:?} after {n} Backspaces");
-            for _ in 0..n {
-                self.forward_key(&path, KS_BACKSPACE, KEY_BACKSPACE, 0);
-                self.forward_key(&path, KS_BACKSPACE, KEY_BACKSPACE, RELEASE);
-            }
-            self.queued_at = Instant::now();
-            self.gate = Some((Wait::Commit(path, text), self.queued_at + KEY_SETTLE));
-        }
+        let Replacement { path, text, retype_backs, .. } = replacement;
+        log!("ibus: deletion dropped, retyping {text:?} after {retype_backs} Backspaces");
+        self.forward_backspaces(&path, retype_backs);
+        self.gate = Some((Wait::Commit(path, text), self.queued_at + KEY_SETTLE));
         true
     }
 
@@ -575,21 +600,23 @@ impl Ime {
         if (iface.as_str(), member.as_str()) == (IFACE_ENGINE, "ProcessKeyEvent") {
             return self.key_call(msg); // answered by itself, maybe later
         }
-        if let Some((Wait::Replace(..), until)) = &mut self.gate {
+        if let Some((Wait::Replace(replacement), until)) = &mut self.gate {
             // Firefox resets and refocuses the field after a correction that
             // replaced all its text, before reporting it: part of the same edit,
             // so the check and the word in progress carry on.
-            match member.as_str() {
-                "Reset" | "FocusOut" | "FocusOutId" => {
-                    *until = Instant::now() + REPORT_WAIT;
-                    return self.send(msg.method_return());
+            if replacement.insert_first {
+                match member.as_str() {
+                    "Reset" | "FocusOut" | "FocusOutId" => {
+                        *until = Instant::now() + REPORT_WAIT;
+                        return self.send(msg.method_return());
+                    }
+                    "FocusIn" | "FocusInId" => {
+                        *until = Instant::now() + REPORT_WAIT;
+                        self.send(self.signal(&path, "RequireSurroundingText"));
+                        return self.send(msg.method_return());
+                    }
+                    _ => {}
                 }
-                "FocusIn" | "FocusInId" => {
-                    *until = Instant::now() + REPORT_WAIT;
-                    self.send(self.signal(&path, "RequireSurroundingText"));
-                    return self.send(msg.method_return());
-                }
-                _ => {}
             }
         }
         if matches!(member.as_str(), "FocusIn" | "FocusInId" | "FocusOut" | "FocusOutId" | "Reset" | "Disable" | "Destroy") {
@@ -614,6 +641,7 @@ impl Ime {
                 self.forget_text();
                 self.before = None;
                 self.reports_lag = false;
+                self.deletes_ignored = false;
                 self.after_escape = false;
                 self.last_char = None;
                 // Ask the application for its text, so deletions can be atomic.
@@ -799,6 +827,8 @@ pub fn run(sig_fd: i32) -> ! {
         while let Some(msg) = ime.ch.pop_message() {
             ime.handle(msg);
         }
+        // Process reports already queued on D-Bus before timing out an edit.
+        ime.tick();
         ime.ch.flush();
         if !ime.ch.is_connected() {
             log!("ibus: daemon gone");
@@ -816,7 +846,6 @@ pub fn run(sig_fd: i32) -> ! {
             log!("ibus: connection lost");
             std::process::exit(0);
         }
-        ime.tick();
     }
 }
 
@@ -1041,5 +1070,34 @@ mod tests {
         assert!(xml.contains(&format!("<name>{ENGINE}</name>")));
         assert_eq!(shell_quote("/usr/bin/unikey"), "/usr/bin/unikey");
         assert_eq!(xml_escape("a&b<c"), "a&amp;b&lt;c");
+    }
+
+    #[test]
+    fn repairs_duplicated_telex_vowels_after_an_ignored_deletion() {
+        for accented in ["á", "à"] {
+            let edit = Replacement::new("/engine", "a", 1, 1, accented, true);
+            assert_eq!(edit.expected, accented);
+            assert!(!edit.repair_needed(Some(accented)));
+            let mut field = format!("a{accented}");
+            assert!(edit.repair_needed(Some(&field)));
+            assert_eq!(edit.retype_backs, 2);
+            for _ in 0..edit.retype_backs {
+                field.pop();
+            }
+            field.push_str(&edit.text);
+            assert_eq!(field, accented);
+        }
+    }
+
+    #[test]
+    fn verifies_an_ordinary_replacement_without_erasing_on_stale_reports() {
+        let edit = Replacement::new("/engine", "chữ á", 'á'.len_utf8(), 1, "à", false);
+        assert_eq!(edit.expected, "chữ à");
+        assert!(edit.repair_needed(Some("chữ áà")));
+        assert_eq!(edit.retype_backs, 2); // Backspace counts characters, not bytes.
+        assert!(!edit.repair_needed(Some("chữ à")));
+        assert!(!edit.repair_needed(Some("chữ á")));
+        assert!(!edit.repair_needed(Some("different field")));
+        assert!(!edit.repair_needed(None));
     }
 }
