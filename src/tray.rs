@@ -67,7 +67,7 @@ fn toggle() {
     unsafe { libc::kill(libc::getpid(), libc::SIGUSR2) };
 }
 
-fn open_settings() {
+pub fn open_settings() {
     use std::os::unix::process::CommandExt;
     let exe = std::env::current_exe().ok().and_then(|p| Some(p.parent()?.join("unikey-settings")));
     let exe = exe.filter(|p| p.exists()).unwrap_or_else(|| "unikey-settings".into());

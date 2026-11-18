@@ -446,7 +446,8 @@ fn build_window(app: &adw::Application) {
         let banner = banner.clone();
         move || {
             show_mode(vietnamese_on());
-            banner.set_revealed(settings::daemon_pids().is_empty());
+            // On GNOME IBus starts unikey when its input source is picked.
+            banner.set_revealed(settings::daemon_pids().is_empty() && !settings::runs_in_ibus());
         }
     };
     refresh_status();
