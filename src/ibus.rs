@@ -18,11 +18,11 @@
 //! and property lists travel as IBus "serializable" structs.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     env, fs,
     path::{Path, PathBuf},
     process::Command,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use dbus::{
@@ -80,6 +80,34 @@ const KS_KP_9: u32 = 0xffb9;
 const KS_Z_LOWER: u32 = 0x7a;
 const KS_Z_UPPER: u32 = 0x5a;
 
+/// GNOME Shell does not wait for one key's answer before sending us the next.
+/// Keys we pass through and Backspaces we forward go back into its event queue
+/// and reach the application later, while a commit or a deletion of text
+/// applies at once and can overtake them. So while our output is on its way we
+/// hold the next keys back (unanswered), until:
+///
+/// - the field reports text showing it (a deletion is counted against Mutter's
+///   copy of that text, which must be up to date), at most `REPORT_WAIT`;
+/// - for fields that report nothing (terminals), `KEY_SETTLE` after the last key
+///   that went through the event queue; a commit waits for that too.
+const REPORT_WAIT: Duration = Duration::from_millis(60);
+const KEY_SETTLE: Duration = Duration::from_millis(25);
+
+enum Wait {
+    /// Until the field reports the text we expect before its cursor.
+    Report,
+    /// Then commit this text (engine object path, text).
+    Commit(String, String),
+    /// A correction replacing all of a field's text went in as "insert, then
+    /// delete what is before it" (see `Ime::edit`); the report tells whether the
+    /// deletion was dropped. (path, text before the edit, deleted count, inserted text)
+    Replace(String, String, usize, String),
+}
+
+/// How long a report showing the insertion but not the deletion must stay the
+/// latest before we call the deletion dropped (see `Ime::replace_settled`).
+const REPLACE_SETTLE: Duration = Duration::from_millis(15);
+
 // ---- the engine ---------------------------------------------------------------------
 
 struct Ime {
@@ -102,6 +130,14 @@ struct Ime {
     swallow: Option<u32>,
     after_escape: bool,
     last_char: Option<char>,
+    /// What we wait for before taking the next key, and until when (see `Wait`).
+    gate: Option<(Wait, Instant)>,
+    /// ProcessKeyEvent calls held back meanwhile, answered in order.
+    held: VecDeque<Message>,
+    /// When a key last went through GNOME Shell's event queue (passed or forwarded).
+    queued_at: Instant,
+    /// This field's reports did not catch up in time once: stop waiting for them.
+    reports_lag: bool,
 }
 
 impl Ime {
@@ -124,6 +160,10 @@ impl Ime {
             swallow: None,
             after_escape: false,
             last_char: None,
+            gate: None,
+            held: VecDeque::new(),
+            queued_at: Instant::now(),
+            reports_lag: false,
         }
     }
 
@@ -150,19 +190,39 @@ impl Ime {
     /// Delete `backs` characters before the cursor and insert `text`.
     fn edit(&mut self, path: &str, backs: usize, text: &str) {
         log!("ibus edit: delete {backs}, insert {text:?}");
-        if backs > 0 {
-            if self.can_delete_surrounding(backs) {
-                let n = backs as u32;
-                self.send(self.signal(path, "DeleteSurroundingText").append2(-(n as i32), n));
-            } else {
-                for _ in 0..backs {
-                    self.forward_key(path, KS_BACKSPACE, KEY_BACKSPACE, 0);
-                    self.forward_key(path, KS_BACKSPACE, KEY_BACKSPACE, RELEASE);
-                }
+        let atomic = backs > 0 && self.can_delete_surrounding(backs);
+        // Deleting first would empty the field. GNOME Shell's own entries (the
+        // overview search) then end and lose focus, and the text committed next
+        // is lost. So insert first, then delete what is before it: Shell entries
+        // apply that as is, while Mutter drops it for applications (their delete
+        // must touch the cursor), which the next report shows (see `on_report`).
+        let replace = atomic && !text.is_empty() && self.report_caught_up() && self.before.as_ref().is_some_and(|b| b.chars().count() == backs);
+        if replace {
+            self.commit(path, text);
+            let len = text.chars().count();
+            self.send(self.signal(path, "DeleteSurroundingText").append2(-((backs + len) as i32), backs as u32));
+            let before = self.before.clone().unwrap_or_default();
+            self.gate = Some((Wait::Replace(path.to_owned(), before, backs, text.to_owned()), Instant::now() + REPORT_WAIT));
+        } else if atomic {
+            let n = backs as u32;
+            self.send(self.signal(path, "DeleteSurroundingText").append2(-(n as i32), n));
+        } else {
+            for _ in 0..backs {
+                self.forward_key(path, KS_BACKSPACE, KEY_BACKSPACE, 0);
+                self.forward_key(path, KS_BACKSPACE, KEY_BACKSPACE, RELEASE);
+            }
+            if backs > 0 {
+                self.queued_at = Instant::now();
             }
         }
-        if !text.is_empty() {
-            self.commit(path, text);
+        let settled = self.queued_at + KEY_SETTLE;
+        if !text.is_empty() && !replace {
+            if atomic || Instant::now() >= settled {
+                self.commit(path, text);
+            } else {
+                // Not before the keys queued ahead of it (see `Wait`).
+                self.gate = Some((Wait::Commit(path.to_owned(), text.to_owned()), settled));
+            }
         }
         let keep = self.shown.len().saturating_sub(backs);
         self.shown.truncate(keep);
@@ -187,6 +247,147 @@ impl Ime {
 
     fn forget_text(&mut self) {
         self.shown.clear();
+    }
+
+    /// The field's last report ends with what we put before its cursor.
+    fn report_caught_up(&self) -> bool {
+        let n = self.shown.len().min(16);
+        self.before.as_ref().is_some_and(|b| b.chars().rev().take(n).eq(self.shown.iter().rev().take(n).copied()))
+    }
+
+    fn waits_for_reports(&self) -> bool {
+        self.caps & CAP_SURROUNDING_TEXT != 0 && self.before.is_some() && !self.reports_lag && self.purpose != PURPOSE_TERMINAL
+    }
+
+    // ---- holding keys back (see `Wait`) ---------------------------------------------
+
+    /// A ProcessKeyEvent call: answer it now, or hold it while output is on its way.
+    fn key_call(&mut self, msg: Message) {
+        if self.gate.is_some() || !self.held.is_empty() {
+            self.held.push_back(msg);
+        } else {
+            self.answer_key(msg);
+        }
+    }
+
+    fn answer_key(&mut self, msg: Message) {
+        let path = msg.path().map(|p| p.to_string()).unwrap_or_default();
+        let (keyval, keycode, state) = msg.read3::<u32, u32, u32>().unwrap_or_default();
+        let done = self.process_key(&path, keyval, keycode, state);
+        if !done {
+            self.queued_at = Instant::now(); // GNOME Shell replays it to the application
+        }
+        self.send(msg.method_return().append1(done));
+        if self.gate.is_none() && state & RELEASE == 0 && self.waits_for_reports() && !self.report_caught_up() {
+            self.gate = Some((Wait::Report, Instant::now() + REPORT_WAIT));
+        }
+    }
+
+    /// Stop waiting: send a held commit; a report that never came means this
+    /// field's reports cannot be waited for.
+    fn open_gate(&mut self, timed_out: bool) {
+        match self.gate.take() {
+            Some((Wait::Commit(path, text), _)) => self.commit(&path, &text),
+            Some((Wait::Report, _)) if timed_out => {
+                log!("ibus: no text report in time, not waiting for them in this field");
+                self.reports_lag = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// The field reported its text: maybe what a held key waits for.
+    fn on_report(&mut self) {
+        let Some(now) = self.before.clone() else { return };
+        match &self.gate {
+            Some((Wait::Report, _)) if self.report_caught_up() => {}
+            Some((Wait::Replace(_, before, _, text), until)) => {
+                if now == format!("{before}{text}") {
+                    // Mutter dropped the deletion (an application), or a Shell entry
+                    // reports between the insertion and the deletion: the latter's
+                    // next report follows at once (see `replace_settled`).
+                    let until = (*until).min(Instant::now() + REPLACE_SETTLE);
+                    if let Some((_, u)) = self.gate.as_mut() {
+                        *u = until;
+                    }
+                    return;
+                }
+                if now != *text {
+                    return; // a report from before the edit
+                }
+            }
+            _ => return,
+        }
+        self.gate = None;
+        self.drain();
+    }
+
+    /// The `Wait::Replace` deadline. Only GNOME Shell's own entries apply the
+    /// insert-then-delete, and they report the result at once. Anything else (the
+    /// old text and the new, a stale report, none at all: Firefox resets the field
+    /// and reports nothing) means the deletion was dropped: replace both.
+    fn replace_settled(&mut self) -> bool {
+        if !matches!(self.gate, Some((Wait::Replace(..), _))) {
+            return false;
+        }
+        let Some((Wait::Replace(path, before, backs, text), _)) = self.gate.take() else { return false };
+        if self.before.as_deref() == Some(text.as_str()) {
+            self.gate = None;
+            return false;
+        }
+        let n = backs + text.chars().count();
+        if self.before.as_deref() == Some(&format!("{before}{text}")) {
+            // Mutter knows the text: one atomic step.
+            log!("ibus: deletion dropped, replacing {before:?}{text:?} with {text:?}");
+            self.send(self.signal(&path, "DeleteSurroundingText").append2(-(n as i32), n as u32));
+            self.commit(&path, &text);
+            self.gate = Some((Wait::Report, Instant::now() + REPORT_WAIT));
+        } else {
+            // No fresh report to count a deletion against: Backspace keys, then the text.
+            log!("ibus: deletion dropped, no report: retyping {text:?} after {n} Backspaces");
+            for _ in 0..n {
+                self.forward_key(&path, KS_BACKSPACE, KEY_BACKSPACE, 0);
+                self.forward_key(&path, KS_BACKSPACE, KEY_BACKSPACE, RELEASE);
+            }
+            self.queued_at = Instant::now();
+            self.gate = Some((Wait::Commit(path, text), self.queued_at + KEY_SETTLE));
+        }
+        true
+    }
+
+    /// Answer held keys until one has to wait again.
+    fn drain(&mut self) {
+        while self.gate.is_none() {
+            let Some(msg) = self.held.pop_front() else { break };
+            self.answer_key(msg);
+        }
+    }
+
+    /// Before a focus change: everything held goes out now, in order.
+    fn settle_all(&mut self) {
+        loop {
+            self.open_gate(false);
+            let Some(msg) = self.held.pop_front() else { break };
+            self.answer_key(msg);
+        }
+    }
+
+    /// The gate's deadline passed.
+    fn tick(&mut self) {
+        if self.gate.as_ref().is_some_and(|(_, until)| Instant::now() >= *until) {
+            if self.replace_settled() {
+                return;
+            }
+            self.open_gate(true);
+            self.drain();
+        }
+    }
+
+    /// Poll timeout until the gate's deadline (-1: none).
+    fn timeout_ms(&self) -> i32 {
+        self.gate.as_ref().map_or(-1, |(_, until)| {
+            until.saturating_duration_since(Instant::now()).as_micros().div_ceil(1000) as i32
+        })
     }
 
     /// Terminals neither report their text nor take deletions.
@@ -371,6 +572,29 @@ impl Ime {
         let path = msg.path().map(|p| p.to_string()).unwrap_or_default();
         let iface = msg.interface().map(|i| i.to_string()).unwrap_or_default();
         let member = msg.member().map(|m| m.to_string()).unwrap_or_default();
+        if (iface.as_str(), member.as_str()) == (IFACE_ENGINE, "ProcessKeyEvent") {
+            return self.key_call(msg); // answered by itself, maybe later
+        }
+        if let Some((Wait::Replace(..), until)) = &mut self.gate {
+            // Firefox resets and refocuses the field after a correction that
+            // replaced all its text, before reporting it: part of the same edit,
+            // so the check and the word in progress carry on.
+            match member.as_str() {
+                "Reset" | "FocusOut" | "FocusOutId" => {
+                    *until = Instant::now() + REPORT_WAIT;
+                    return self.send(msg.method_return());
+                }
+                "FocusIn" | "FocusInId" => {
+                    *until = Instant::now() + REPORT_WAIT;
+                    self.send(self.signal(&path, "RequireSurroundingText"));
+                    return self.send(msg.method_return());
+                }
+                _ => {}
+            }
+        }
+        if matches!(member.as_str(), "FocusIn" | "FocusInId" | "FocusOut" | "FocusOutId" | "Reset" | "Disable" | "Destroy") {
+            self.settle_all();
+        }
         let reply = match (iface.as_str(), member.as_str()) {
             (IFACE_FACTORY, "CreateEngine") => {
                 let name: &str = msg.read1().unwrap_or_default();
@@ -384,16 +608,12 @@ impl Ime {
                 self.objects.retain(|o| *o != path);
                 msg.method_return()
             }
-            (IFACE_ENGINE, "ProcessKeyEvent") => {
-                let (keyval, keycode, state) = msg.read3::<u32, u32, u32>().unwrap_or_default();
-                let done = self.process_key(&path, keyval, keycode, state);
-                msg.method_return().append1(done)
-            }
             (IFACE_ENGINE, "FocusIn" | "FocusInId") => {
                 log!("ibus: focus in");
                 self.engine.reset();
                 self.forget_text();
                 self.before = None;
+                self.reports_lag = false;
                 self.after_escape = false;
                 self.last_char = None;
                 // Ask the application for its text, so deletions can be atomic.
@@ -426,6 +646,7 @@ impl Ime {
                 let anchor: u32 = it.read().unwrap_or(cursor);
                 self.before = text.filter(|_| cursor == anchor).map(|t| t.chars().take(cursor as usize).collect());
                 log!("ibus: before cursor {:?}", self.before);
+                self.on_report();
                 msg.method_return()
             }
             (IFACE_ENGINE, "PropertyActivate") => {
@@ -458,7 +679,8 @@ impl Ime {
                     if let Some(v) = it.get::<Variant<Box<dyn RefArg>>>() {
                         if let Some(mut fields) = v.0.as_iter() {
                             self.purpose = fields.next().and_then(|p| p.as_u64()).unwrap_or(0) as u32;
-                            log!("ibus: content purpose {}", self.purpose);
+                            let hints = fields.next().and_then(|h| h.as_u64()).unwrap_or(0);
+                            log!("ibus: content purpose {} hints {hints:#x}", self.purpose);
                         }
                     }
                 }
@@ -586,7 +808,7 @@ pub fn run(sig_fd: i32) -> ! {
             libc::pollfd { fd: ime.ch.watch().fd, events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: sig_fd, events: libc::POLLIN, revents: 0 },
         ];
-        unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ime.timeout_ms()) };
         for sig in pending_signals(sig_fd) {
             ime.on_signal(sig);
         }
@@ -594,6 +816,7 @@ pub fn run(sig_fd: i32) -> ! {
             log!("ibus: connection lost");
             std::process::exit(0);
         }
+        ime.tick();
     }
 }
 
@@ -699,6 +922,7 @@ pub fn component_xml(exec: &str, setup: &str) -> String {
   <exec>{exec} --ibus</exec>
   <version>{version}</version>
   <license>GPL-3.0-or-later</license>
+  <author>unikey-rs</author>
   <homepage>https://github.com/bhhoang/unikey-rs</homepage>
   <textdomain>unikey</textdomain>
   <engines>
@@ -708,6 +932,7 @@ pub fn component_xml(exec: &str, setup: &str) -> String {
       <description>Vietnamese typing: Telex, VNI, VIQR (unikey-rs)</description>
       <language>vi</language>
       <license>GPL-3.0-or-later</license>
+      <author>unikey-rs</author>
       <icon>input-keyboard</icon>
       <layout>us</layout>
       <rank>99</rank>
