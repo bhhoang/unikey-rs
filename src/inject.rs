@@ -27,6 +27,39 @@ const TEXT_KEYS: [u32; 48] = [
     32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 57,
 ];
 
+/// The evdev key that types `c` without Shift on a US layout. Chromium tells
+/// web pages which physical key was pressed (`code`), and pages act on it: a
+/// space sent on the "1" key makes YouTube seek to 10% instead of pausing.
+fn us_key(c: char) -> Option<u32> {
+    const ROWS: [(&str, u32); 4] = [("1234567890-=", 2), ("qwertyuiop[]", 16), ("asdfghjkl;'`", 30), ("zxcvbnm,./", 44)];
+    match c {
+        ' ' => Some(57),
+        '\\' => Some(43),
+        _ => ROWS.iter().find_map(|(row, first)| row.find(c).map(|i| first + i as u32)),
+    }
+}
+
+/// Assign a key to each distinct character of `chars` (at most
+/// `TEXT_KEYS.len()`): its own key when it has one, else a spare one. Returns
+/// the keymap entries and the keys to tap, in order.
+fn layout(chars: &[char]) -> (Vec<(u32, char)>, Vec<u32>) {
+    let mut keys: Vec<(u32, char)> = Vec::new();
+    // Own keys first, so a spare never takes a key another character needs.
+    for &c in chars {
+        if let Some(key) = us_key(c).filter(|_| !keys.iter().any(|k| k.1 == c)) {
+            keys.push((key, c));
+        }
+    }
+    for &c in chars {
+        if !keys.iter().any(|k| k.1 == c) {
+            let key = TEXT_KEYS.into_iter().find(|t| !keys.iter().any(|k| k.0 == *t)).expect("a free key");
+            keys.push((key, c));
+        }
+    }
+    let taps = chars.iter().map(|&c| keys.iter().find(|k| k.1 == c).unwrap().0).collect();
+    (keys, taps)
+}
+
 pub struct Injector {
     vk: ZwpVirtualKeyboardV1,
     time: u32,
@@ -37,12 +70,12 @@ pub struct Injector {
 ///
 /// It also maps a Shift key (never pressed): GTK3 ignores BackSpace from a
 /// keymap that has no modifier keys at all.
-pub fn keymap(chars: &[char]) -> String {
+pub fn keymap(keys: &[(u32, char)]) -> String {
     let mut codes = format!("    <BKSP> = {};\n    <LFSH> = {};\n", KEY_BACKSPACE + 8, KEY_LEFTSHIFT + 8);
     let mut syms =
         String::from("    key <BKSP> { [ BackSpace ] };\n    key <LFSH> { [ Shift_L ] };\n    modifier_map Shift { <LFSH> };\n");
-    for (i, c) in chars.iter().enumerate() {
-        codes += &format!("    <K{i:02}> = {};\n", TEXT_KEYS[i] + 8);
+    for (i, (key, c)) in keys.iter().enumerate() {
+        codes += &format!("    <K{i:02}> = {};\n", key + 8);
         syms += &format!("    key <K{i:02}> {{ [ U{:04X} ] }};\n", *c as u32);
     }
     format!(
@@ -66,8 +99,8 @@ impl Injector {
         self.time = self.time.wrapping_add(2);
     }
 
-    fn upload(&self, chars: &[char]) -> bool {
-        let text = keymap(chars);
+    fn upload(&self, keys: &[(u32, char)]) -> bool {
+        let text = keymap(keys);
         let fd = unsafe { libc::memfd_create(c"unikey-keymap".as_ptr(), libc::MFD_CLOEXEC) };
         if fd < 0 {
             return false;
@@ -88,7 +121,8 @@ impl Injector {
         let mut sent = Vec::new();
         let chunks: Vec<&[char]> = if chars.is_empty() { vec![&[]] } else { chars.chunks(TEXT_KEYS.len()).collect() };
         for (n, chunk) in chunks.into_iter().enumerate() {
-            if !self.upload(chunk) {
+            let (keys, taps) = layout(chunk);
+            if !self.upload(&keys) {
                 eprintln!("unikey: cannot create a keymap for the correction");
                 return sent;
             }
@@ -98,9 +132,9 @@ impl Injector {
                     sent.push(KEY_BACKSPACE);
                 }
             }
-            for i in 0..chunk.len() {
-                self.tap(TEXT_KEYS[i]);
-                sent.push(TEXT_KEYS[i]);
+            for key in taps {
+                self.tap(key);
+                sent.push(key);
             }
         }
         sent
@@ -114,14 +148,20 @@ mod tests {
 
     #[test]
     fn keymap_compiles_and_maps_the_characters() {
-        let chars = ['ê', 'ơ', 'Đ', 'a'];
+        let chars = ['ê', 'ơ', 'Đ', 'a', ' ', 'ê', 'A', '1'];
+        let (keys, taps) = layout(&chars);
         let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-        let km = xkb::Keymap::new_from_string(&ctx, keymap(&chars), xkb::KEYMAP_FORMAT_TEXT_V1, xkb::KEYMAP_COMPILE_NO_FLAGS)
+        let km = xkb::Keymap::new_from_string(&ctx, keymap(&keys), xkb::KEYMAP_FORMAT_TEXT_V1, xkb::KEYMAP_COMPILE_NO_FLAGS)
             .expect("keymap compiles");
         let state = xkb::State::new(&km);
-        for (i, c) in chars.iter().enumerate() {
-            assert_eq!(state.key_get_utf8(xkb::Keycode::new(TEXT_KEYS[i] + 8)), c.to_string());
+        for (key, c) in taps.iter().zip(chars) {
+            assert!(TEXT_KEYS.contains(key));
+            assert_eq!(state.key_get_utf8(xkb::Keycode::new(key + 8)), c.to_string());
         }
+        // Characters with a key of their own go out on it (Space on the space
+        // bar, not on "1"); the "1" key is then left for '1' itself.
+        assert_eq!(&taps[3..], &[30, 57, taps[0], taps[6], 2]);
+        assert_ne!(taps[6], 30, "'A' cannot share the A key with 'a'");
         assert_eq!(state.key_get_one_sym(xkb::Keycode::new(KEY_BACKSPACE + 8)).raw(), 0xff08);
         // GTK3 needs a real modifier in the keymap to accept BackSpace.
         let mut state = xkb::State::new(&km);
